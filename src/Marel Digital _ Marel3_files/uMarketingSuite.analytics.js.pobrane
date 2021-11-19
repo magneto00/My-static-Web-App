@@ -1,0 +1,356 @@
+﻿window.uMarketingSuite = (function(ums) {
+    ums.analytics = (function() {
+        (function polyfills() {
+            // Element.closest
+            // from: https://developer.mozilla.org/en-US/docs/Web/API/Element/closest#Polyfill
+            if (!Element.prototype.matches) {
+                Element.prototype.matches =
+                    Element.prototype.msMatchesSelector ||
+                    Element.prototype.webkitMatchesSelector;
+            }
+
+            if (!Element.prototype.closest) {
+                Element.prototype.closest = function(s) {
+                    var el = this;
+
+                    do {
+                        if (Element.prototype.matches.call(el, s)) return el;
+                        el = el.parentElement || el.parentNode;
+                    } while (el !== null && el.nodeType === 1);
+                    return null;
+                };
+            }
+        })();
+
+        var state = {
+            // Set via init.
+            pageviewGuid: null,
+
+            // Version of client side JSON format
+            version: 4,
+
+            timeOnPage: {
+                start: getTimestamp(),
+            },
+
+            scrollDepth: {
+                pixels: 0,
+                percentage: 0,
+            },
+
+            // format: { href: string, timeClicked: Date }
+            links: [],
+
+            // Generic events (category/label/action etc)
+            events: [],
+        };
+
+        function init(pageviewGuid) {
+            state.pageviewGuid = pageviewGuid;
+
+            trackScrollDepth();
+            initLinks();
+            engagementTracker.init();
+            window.addEventListener("unload", sendClientSideData, false);
+
+            if (typeof ums.init === "function") {
+                ums.init();
+            }
+        }
+
+        function initLinks() {
+            document.addEventListener("click", onClick);
+            document.addEventListener("auxclick", onClick);
+
+            function onClick(evt) {
+                // We work with the <a> element closest to the element being clicked.
+                // This is necessary to properly recognize clicks on element nested inside an <a>
+                // which will trigger the <a> but do not trigger the onClick event for the <a> itself.
+                var a = evt.target.closest("a");
+                if (a == null || a.href == null || a.href.length === 0) {
+                    return;
+                }
+
+                if (evt.button !== 0 && evt.button !== 1) {
+                    // Only track left or middle button clicks on links
+                    return;
+                }
+
+                var href = a.href;
+
+                // Link should be one of the following:
+                // 1) External (link domain different from current domain)
+                // 2) Points to pdf/doc/docx
+                // 3) Anchor link (e.g. #header)
+                // 4) mailto: or tel: link
+                // Anything else will not be tracked.
+                var currentDomain = window.location.origin;
+                var isExternal = href.indexOf("http") === 0 && href.indexOf(currentDomain) !== 0;
+                var isDocument = /\.(?:pdf|doc|docx)(?:\?|$)/i.test(href);
+                var isAnchor = href.indexOf("#") === 0 || href.indexOf(currentDomain + "/#") === 0;
+                var isMailToOrTel = href.indexOf("mailto:") === 0 || href.indexOf("tel:") === 0;
+
+                var shouldBeTracked = isExternal || isDocument || isAnchor || isMailToOrTel;
+
+                if (shouldBeTracked) {
+                    state.links.push({ href: href, timeClicked: new Date() });
+                }
+            }
+        }
+
+        function getTimestamp() {
+            return (performance && typeof performance.now === "function" && performance.now()) || +new Date();
+        }
+
+        function getTimeOnPage() {
+            var end = getTimestamp();
+
+            var totalTimeMillis = Math.floor(end - state.timeOnPage.start);
+            var engagedTimeMillis = engagementTracker.getTimeEngaged();
+
+            return {
+                totalTimeMillis: totalTimeMillis,
+                engagedTimeMillis: engagedTimeMillis
+            }
+        }
+
+        function getScrollDepth() {
+            return {
+                pixels: state.scrollDepth.pixels,
+                percentage: state.scrollDepth.percentage,
+            }
+        }
+
+        function getLinks() {
+            return state.links;
+        }
+
+        function getEvents() {
+            return state.events;
+        }
+
+        function getClientSideData() {
+            var timeOnPage = getTimeOnPage();
+            var scrollDepth = getScrollDepth();
+            var links = getLinks();
+            var events = getEvents();
+
+            return {
+                timeOnPage: timeOnPage,
+                scrollDepth: scrollDepth,
+                links: links,
+                events: events,
+            }
+        }
+
+        function sendClientSideData() {
+            if (state.pageviewGuid == null) {
+                return;
+            }
+
+            var data = getClientSideData();
+            var url = "/umbraco/umarketingsuite/pagedata/collect?version=" + state.version + "&pageviewGuid=" + state.pageviewGuid;
+
+            // https://developer.mozilla.org/en-US/docs/Web/API/Navigator/sendBeacon
+            if (typeof navigator.sendBeacon === "function") {
+                navigator.sendBeacon(url, JSON.stringify(data));
+            } else {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', url, false);
+                xhr.setRequestHeader("Content-Type", "application/json");
+                var payload = JSON.stringify(data);
+                xhr.send(payload);
+            }
+        }
+
+        function debounce(func, wait) {
+            var timeout;
+            return function() {
+                var context = this;
+                var args = arguments;
+                var later = function() {
+                    timeout = null;
+                    func.apply(context, args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        };
+
+        function trackScrollDepth() {
+            window.addEventListener("scroll", debounce(recordScrollDepth, 100), false);
+            document.addEventListener("DOMContentLoaded", recordScrollDepth);
+            recordScrollDepth();
+
+            function recordScrollDepth() {
+                var documentHeight = document.documentElement.offsetHeight;
+                var scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
+                var viewportHeight = window.innerHeight;
+                var viewportBottom = viewportHeight + scrollPosition;
+
+                var percentage = Math.round((Math.min(viewportBottom, documentHeight) / documentHeight) * 100);
+
+                if (percentage > state.scrollDepth.percentage) {
+                    state.scrollDepth.percentage = percentage;
+                }
+
+                if (viewportBottom > state.scrollDepth.pixels) {
+                    state.scrollDepth.pixels = Math.floor(viewportBottom);
+                }
+            }
+        }
+
+        function trackEvent(fields) {
+            state.events.push(fields)
+        }
+
+        var engagementTracker = (function() {
+            var startEngage = now();
+            var timeEngaged = 0;
+            var idle = true;
+            var idleTimer;
+
+            function now() {
+                return new Date().getTime();
+            }
+
+            function setIdle() {
+                updateTimeEngaged();
+                idle = true;
+            };
+
+            function pulse() {
+                if (idle) {
+                    idle = false;
+                    startEngage = now();
+                }
+                window.clearTimeout(idleTimer);
+                idleTimer = window.setTimeout(setIdle, 5000);
+            };
+
+            function addListener(evt, cb) {
+                if (window.addEventListener) {
+                    window.addEventListener(evt, cb);
+                } else if (window.attachEvent) {
+                    window.attachEvent('on' + evt, cb);
+                }
+            };
+
+            function updateTimeEngaged() {
+                if (idle) {
+                    return;
+                }
+
+                var endEngage = now();
+
+                timeEngaged += endEngage - startEngage;
+                startEngage = endEngage;
+            }
+
+            function init() {
+                addListener('mousedown', pulse);
+                addListener('keydown', pulse);
+                addListener('scroll', pulse);
+                addListener('mousemove', pulse);
+                idleTimer = window.setTimeout(setIdle, 5000);
+            }
+
+            function getTimeEngaged() {
+                updateTimeEngaged();
+                return timeEngaged;
+            }
+
+            return {
+                init: init,
+                getTimeEngaged: getTimeEngaged,
+            };
+        })();
+
+        return {
+            init: init,
+            trackEvent: trackEvent,
+            getClientSideData: getClientSideData,
+        };
+    })();
+
+    return ums;
+})(window.uMarketingSuite || {});
+
+window.ums = window.ums || (function() {
+    var api = (function init() {
+        function sendEvent(fields) {
+            fields.timestamp = parseInt(+new Date() / 1000, 10);
+            uMarketingSuite.analytics.trackEvent(fields);
+        }
+
+        return {
+            event: {
+                send: sendEvent
+            }
+        };
+    })();
+
+    function eventArgumentParser(args) {
+        var fields = {};
+        for (var i = 0; i < args.length; i++) {
+            var arg = args[i];
+
+            if (typeof arg === 'string') {
+                switch (i) {
+                    case 0: break; // command => skip
+                    case 1: fields.hitType = arg; break; // hitType
+                    case 2: fields.category = arg; break; // category
+                    case 3: fields.action = arg; break; // action 
+                    case 4: fields.label = arg; break; // label
+                }
+            } else if (typeof arg === 'number') {
+                // This is the only number field type we support
+                fields.value = arg;
+            } else if (typeof arg === 'object') {
+                // fieldsObject is always the last one to be passed
+                Object.apply(fields, arg);
+                break;
+            }
+        }
+        return fields;
+    }
+
+    var hitTypeServiceMap = {
+        'event': {
+            argumentParser: eventArgumentParser,
+            api: function() { return api.event; }
+        }
+        // Currently not (yet) supported: 
+        // ,'exception': exceptionHandler
+        // ,'item': itemHandler
+        // ,'pageview': pageviewHandler
+        // ,'social': socialhandler
+        // ,'screenview': screenviewHandler
+        // ,'timing': timingHandler
+        // ,'transaction': transactionHandler
+    };
+
+    // Expose the ums API as a function just like Google Analytics' analytics.js API
+    return function(command, hitType) {
+        if (typeof command !== 'string' || hitType === '') return;
+        if (typeof hitType !== 'string' || hitType === '') return;
+
+        var service = hitTypeServiceMap[hitType];
+
+        if (!service) return;
+
+        var fields = service.argumentParser(arguments);
+
+        var api = service.api();
+
+        var apiCommand = api[command];
+
+        if (apiCommand) {
+            try {
+                apiCommand(fields);
+            } catch (ex) {
+                // For now, silently ignore
+            }
+        }
+    };
+})();
